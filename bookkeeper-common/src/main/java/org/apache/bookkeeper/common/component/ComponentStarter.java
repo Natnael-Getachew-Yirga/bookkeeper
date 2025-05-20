@@ -80,9 +80,9 @@ public class ComponentStarter {
 
         component.publishInfo(new ComponentInfoPublisher());
 
-        log.info("Starting component {}.", component.getName());
+        log.info("Starting From local snapshot component {}.", component.getName());
         component.start();
-        log.info("Started component {}.", component.getName());
+        log.info("Started From local snapshot component {}.", component.getName());
         return future;
     }
 
