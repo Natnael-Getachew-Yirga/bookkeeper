@@ -1,77 +1,63 @@
-#
-# Licensed to the Apache Software Foundation (ASF) under one
-# or more contributor license agreements.  See the NOTICE file
-# distributed with this work for additional information
-# regarding copyright ownership.  The ASF licenses this file
-# to you under the Apache License, Version 2.0 (the
-# "License"); you may not use this file except in compliance
-# with the License.  You may obtain a copy of the License at
-#
-#   http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing,
-# software distributed under the License is distributed on an
-# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-# KIND, either express or implied.  See the License for the
-# specific language governing permissions and limitations
-# under the License.
-#
+# Stage 1: Unpack your local snapshot dist
+FROM ubuntu:22.04 AS bk-dist
+ARG BK_VERSION=4.17.2-SNAPSHOT
+ARG DISTRO_TARBALL=bookkeeper-server-${BK_VERSION}-bin.tar.gz
+COPY bookkeeper-dist/server/target/${DISTRO_TARBALL} /opt/
+WORKDIR /opt
+RUN tar -xzf ${DISTRO_TARBALL} \
+ && mv bookkeeper-server-${BK_VERSION} bookkeeper \
+ && rm ${DISTRO_TARBALL}
 
+# Stage 2: (Optional) jlink custom JRE for size
+FROM eclipse-temurin:17 AS jre-build
+RUN $JAVA_HOME/bin/jlink \
+     --add-modules ALL-MODULE-PATH \
+     --strip-debug \
+     --no-man-pages \
+     --no-header-files \
+     --compress=2 \
+     --output /javaruntime \
+ && echo networkaddress.cache.ttl=1 >> /javaruntime/conf/security/java.security \
+ && echo networkaddress.cache.negative.ttl=1 >> /javaruntime/conf/security/java.security
+
+# Stage 3: Final runtime image
 FROM ubuntu:22.04
-MAINTAINER Apache BookKeeper <dev@bookkeeper.apache.org>
+ARG BK_VERSION=4.17.2-SNAPSHOT
+ENV DEBIAN_FRONTEND=noninteractive \
+    BK_HOME=/opt/bookkeeper \
+    BOOKIE_PORT=3181 \
+    BOOKIE_HTTP_PORT=4181 \
+    BK_USER=bookkeeper
+EXPOSE ${BOOKIE_PORT} ${BOOKIE_HTTP_PORT}
 
-ARG BK_VERSION=4.15.1
-ARG DISTRO_NAME=bookkeeper-server-${BK_VERSION}-bin
-ARG DISTRO_URL=https://archive.apache.org/dist/bookkeeper/bookkeeper-${BK_VERSION}/${DISTRO_NAME}.tar.gz
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      openjdk-17-jdk-headless \
+      python3-pip \
+      wget \
+      sudo \
+ && ln -s /usr/bin/python3 /usr/bin/python \  
+ && rm -rf /var/lib/apt/lists/* \
+ && pip3 install zk-shell
 
-ENV BOOKIE_PORT=3181
-ENV BOOKIE_HTTP_PORT=8080
-EXPOSE $BOOKIE_PORT $BOOKIE_HTTP_PORT
-ENV BK_USER=bookkeeper
-ENV BK_HOME=/opt/bookkeeper
-ENV DEBIAN_FRONTEND=noninteractive
-ARG UBUNTU_MIRROR=http://archive.ubuntu.com/ubuntu/
-ARG UBUNTU_SECURITY_MIRROR=http://security.ubuntu.com/ubuntu/
+ENV JAVA_HOME=/opt/java/openjdk
+COPY --from=jre-build /javaruntime $JAVA_HOME
+ENV PATH="$JAVA_HOME/bin:$PATH"
 
-# Download Apache Bookkeeper, untar and clean up
-RUN set -x \
-    && sed -i -e "s|http://archive\.ubuntu\.com/ubuntu/|${UBUNTU_MIRROR:-http://archive.ubuntu.com/ubuntu/}|g" \
-     -e "s|http://security\.ubuntu\.com/ubuntu/|${UBUNTU_SECURITY_MIRROR:-http://security.ubuntu.com/ubuntu/}|g" /etc/apt/sources.list \
-    && echo 'Acquire::http::Timeout "30";\nAcquire::http::ConnectionAttemptDelayMsec "2000";\nAcquire::https::Timeout "30";\nAcquire::https::ConnectionAttemptDelayMsec "2000";\nAcquire::ftp::Timeout "30";\nAcquire::ftp::ConnectionAttemptDelayMsec "2000";\nAcquire::Retries "15";' > /etc/apt/apt.conf.d/99timeout_and_retries \
-    && adduser "${BK_USER}" \
-    && apt-get update \
-    && apt-get install -y ca-certificates apt-transport-https \
-    && apt-get install -y --no-install-recommends openjdk-17-jdk \
-    && apt-get install -y --no-install-recommends python3 pip \
-    && ln -s /usr/bin/python3 /usr/bin/python \
-    && apt-get install -y --no-install-recommends gpg gpg-agent wget sudo \
-    && apt-get -y --purge autoremove \
-    && apt-get autoclean \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/* \
-    && mkdir -pv /opt \
-    && cd /opt \
-    && wget -q "${DISTRO_URL}" \
-    && wget -q "${DISTRO_URL}.asc" \
-    && wget -q "${DISTRO_URL}.sha512" \
-    && sha512sum -c ${DISTRO_NAME}.tar.gz.sha512 \
-    && wget https://dist.apache.org/repos/dist/release/bookkeeper/KEYS \
-    && gpg --import KEYS \
-    && gpg --batch --verify "$DISTRO_NAME.tar.gz.asc" "$DISTRO_NAME.tar.gz" \
-    && tar -xzf "$DISTRO_NAME.tar.gz" \
-    && mv bookkeeper-server-${BK_VERSION}/ /opt/bookkeeper/ \
-    && rm -rf "$DISTRO_NAME.tar.gz" "$DISTRO_NAME.tar.gz.asc" "$DISTRO_NAME.tar.gz.sha512" \
-    && pip install zk-shell \
-    && JAVA_HOME=$(dirname $(dirname $(readlink -f $(which java)))) \
-    && echo networkaddress.cache.ttl=1 >> $JAVA_HOME/conf/security/java.security \
-    && echo networkaddress.cache.negative.ttl=1 >> $JAVA_HOME/conf/security/java.security
+COPY --from=bk-dist /opt/bookkeeper ${BK_HOME}/
+COPY docker/scripts ${BK_HOME}/scripts
 
-WORKDIR /opt/bookkeeper
+RUN useradd --uid 10000 --gid root --home-dir ${BK_HOME} --shell /bin/bash --no-create-home bookkeeper \
+ && mkdir -p ${BK_HOME}/conf ${BK_HOME}/data/journal ${BK_HOME}/data/ledgers ${BK_HOME}/logs \
+ && chown -R bookkeeper:root ${BK_HOME} \
+ && chmod -R ug+rwX ${BK_HOME}/conf ${BK_HOME}/data ${BK_HOME}/logs \
+ && chmod -R g+rX ${BK_HOME}/scripts ${BK_HOME}/bin \
+ && chmod -R o+rX ${BK_HOME}
 
-COPY scripts /opt/bookkeeper/scripts
-RUN chmod +x -R /opt/bookkeeper/scripts/
-
-ENTRYPOINT [ "/bin/bash", "/opt/bookkeeper/scripts/entrypoint.sh" ]
+WORKDIR ${BK_HOME}
+USER bookkeeper
+ENTRYPOINT ["/bin/bash", "/opt/bookkeeper/scripts/entrypoint.sh"]
 CMD ["bookie"]
-
-HEALTHCHECK --interval=10s --timeout=60s CMD /bin/bash /opt/bookkeeper/scripts/healthcheck.sh
+HEALTHCHECK --interval=10s --timeout=60s \
+  CMD ["/bin/bash", "/opt/bookkeeper/scripts/healthcheck.sh"]
