@@ -26,6 +26,8 @@ import io.netty.util.ReferenceCounted;
 import io.netty.util.concurrent.FastThreadLocal;
 import java.security.GeneralSecurityException;
 import java.security.NoSuchAlgorithmException;
+import java.util.Random;
+
 import org.apache.bookkeeper.client.BKException.BKDigestMatchException;
 import org.apache.bookkeeper.client.LedgerHandle;
 import org.apache.bookkeeper.proto.BookieProtoEncoding;
@@ -48,7 +50,14 @@ public abstract class DigestManager {
 
     public static final int METADATA_LENGTH = 32;
     public static final int LAC_METADATA_LENGTH = 16;
-
+    
+    // For experimental data corruption
+    private static final Random random = new Random();
+    private static final boolean ENABLE_DATA_CORRUPTION = true;
+    // Statistics for corrupted vs normal writes
+    private static int totalWrites = 0;
+    private static int corruptedWrites = 0;
+    
     final long ledgerId;
     final boolean useV2Protocol;
     private final ByteBufAllocator allocator;
@@ -106,6 +115,38 @@ public abstract class DigestManager {
         return password.length > 0 ? MacDigestManager.genDigest("ledger", password) : MacDigestManager.EMPTY_LEDGER_KEY;
     }
 
+    // Helper method to corrupt data for testing checksum validation
+    private boolean corruptDataRandomly(ByteBuf data) {
+        totalWrites++;
+        boolean shouldCorrupt = ENABLE_DATA_CORRUPTION && random.nextBoolean();
+        
+        if (shouldCorrupt) {
+            corruptedWrites++;
+            logger.warn("### CORRUPTING ENTRY DATA ### Ledger: {}, Entry corruption rate: {}% ({} of {} writes)", 
+                    ledgerId, (corruptedWrites * 100 / totalWrites), corruptedWrites, totalWrites);
+            
+            // Make sure we have data to corrupt
+            if (data.readableBytes() > 4) {
+                // Pick a random position in the middle of the data
+                int position = data.readerIndex() + random.nextInt(data.readableBytes() - 4);
+                
+                // Read the current value and write a different value
+                int originalValue = data.getInt(position);
+                data.setInt(position, ~originalValue); // Flip all bits to ensure corruption
+                
+                logger.warn("### CORRUPTED ENTRY DATA ### Flipped bits at position {} from {} to {}", 
+                        position, originalValue, ~originalValue);
+                return true;
+            }
+        } else {
+            logger.info("### NORMAL WRITE ### Ledger: {}, Normal write rate: {}% ({} of {} writes)", 
+                    ledgerId, ((totalWrites - corruptedWrites) * 100 / totalWrites), 
+                    (totalWrites - corruptedWrites), totalWrites);
+        }
+        
+        return false;
+    }
+
     /**
      * Computes the digest for an entry and put bytes together for sending.
      *
@@ -153,7 +194,17 @@ public abstract class DigestManager {
         int digest = update(0, buf, buf.readerIndex(), buf.readableBytes());
         digest = update(digest, data, data.readerIndex(), data.readableBytes());
 
+        // Store the digest
         populateValueAndReset(digest, buf);
+
+        // IMPORTANT: Corrupt the data AFTER computing the digest but BEFORE sending
+        // This simulates a scenario where data is corrupted during transmission
+        boolean wasCorrupted = corruptDataRandomly(data);
+        
+        if (wasCorrupted) {
+            logger.warn("### EXPERIMENT ### Ledger: {}, Entry: {} - Sending entry with VALID checksum but CORRUPTED data", 
+                    ledgerId, entryId);
+        }
 
         // Reset the reader index to the beginning
         buf.readerIndex(0);
@@ -178,6 +229,15 @@ public abstract class DigestManager {
         int digest = update(0, headersBuffer, 0, METADATA_LENGTH);
         digest = update(digest, data, data.readerIndex(), data.readableBytes());
         populateValueAndReset(digest, headersBuffer);
+        
+        // Corrupt the data AFTER computing the digest but BEFORE sending
+        boolean wasCorrupted = corruptDataRandomly(data);
+        
+        if (wasCorrupted) {
+            logger.warn("### EXPERIMENT ### Ledger: {}, Entry: {} - Sending entry with VALID checksum but CORRUPTED data", 
+                    ledgerId, entryId);
+        }
+        
         return ByteBufList.get(headersBuffer, data);
     }
 
