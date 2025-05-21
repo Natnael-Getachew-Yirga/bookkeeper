@@ -333,6 +333,11 @@ class PendingAddOp implements WriteCallback {
                     ledgerId, entryId, addr);
             lh.handleUnrecoverableErrorDuringAdd(rc);
             return;
+        case BKException.Code.DigestMatchException:
+            LOG.warn("Digest match exception on write: L{} E{} on {}",
+                    ledgerId, entryId, addr);
+            lh.handleUnrecoverableErrorDuringAdd(rc);
+            return;
         default:
             if (clientCtx.getConf().delayEnsembleChange) {
                 if (ackSet.failBookieAndCheck(bookieIndex, addr)
