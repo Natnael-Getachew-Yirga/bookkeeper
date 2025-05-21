@@ -38,6 +38,7 @@ enum StatusCode {
     ENOLEDGER = 402;
     ENOENTRY = 403;
     EBADREQ = 404;
+    ECHECKSUM = 405;
 
     // IO/access errors 5xx
     EIO = 501;
