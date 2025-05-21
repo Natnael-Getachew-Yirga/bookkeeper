@@ -23,6 +23,7 @@ package org.apache.bookkeeper.proto;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import java.io.IOException;
+import java.security.GeneralSecurityException;
 import java.util.EnumSet;
 import java.util.concurrent.TimeUnit;
 import org.apache.bookkeeper.bookie.BookieException;
@@ -38,9 +39,13 @@ import org.apache.bookkeeper.stats.OpStatsLogger;
 import org.apache.bookkeeper.util.MathUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.apache.bookkeeper.proto.checksum.DigestManager;
+import org.apache.bookkeeper.client.BKException.BKDigestMatchException;
+import org.apache.bookkeeper.proto.DataFormats.LedgerMetadataFormat.DigestType;
 
 class WriteEntryProcessorV3 extends PacketProcessorBaseV3 {
     private static final Logger logger = LoggerFactory.getLogger(WriteEntryProcessorV3.class);
+    private static final boolean ENABLE_SERVER_SIDE_CHECKSUM_VERIFY = true; // Set to false to disable server-side checksum verification and logging
 
     public WriteEntryProcessorV3(Request request, BookieRequestHandler requestHandler,
                                  BookieRequestProcessor requestProcessor) {
@@ -115,6 +120,47 @@ class WriteEntryProcessorV3 extends PacketProcessorBaseV3 {
         StatusCode status = null;
         byte[] masterKey = addRequest.getMasterKey().toByteArray();
         ByteBuf entryToAdd = Unpooled.wrappedBuffer(addRequest.getBody().asReadOnlyByteBuffer());
+
+        if (ENABLE_SERVER_SIDE_CHECKSUM_VERIFY) {
+            // Log entry data, digest type, and master key for debugging
+            logger.info("[DEBUG] WriteEntryProcessorV3: ledgerId={}, entryId={}, digestType={}, masterKey(hex)={}, entryToAdd(hex)={}",
+                ledgerId,
+                entryId,
+                "CRC32", // update this if you make digestType dynamic
+                io.netty.buffer.ByteBufUtil.hexDump(masterKey),
+                io.netty.buffer.ByteBufUtil.hexDump(entryToAdd));
+
+            // Guess digest type (HMAC is default in BookKeeper)
+            DigestType digestType = DigestType.CRC32; // or CRC32, CRC32C, etc.
+            DigestManager digestManager;
+            try {
+                digestManager = DigestManager.instantiate(
+                    ledgerId,
+                    masterKey,
+                    digestType,
+                    ((org.apache.bookkeeper.bookie.BookieImpl) requestProcessor.getBookie()).getAllocator(),
+                    false // useV2Protocol
+                );
+            } catch (GeneralSecurityException e) {
+                logger.error("Error instantiating DigestManager", e);
+                addResponse.setStatus(StatusCode.EBADREQ);
+                return addResponse.build();
+            }
+            try {
+                // This will throw if the checksum is invalid
+                logger.info("[DEBUG] WriteEntryProcessorV3: Verifying digest for ledgerId={}, entryId={}", ledgerId, entryId);
+                digestManager.verifyDigestAndReturnData(entryId, entryToAdd.duplicate());
+                logger.info("[DEBUG] WriteEntryProcessorV3: Digest verification PASSED for ledgerId={}, entryId={}", ledgerId, entryId);
+            } catch (BKDigestMatchException e) {
+                logger.warn("Checksum mismatch for L{} E{}. Entry will not be written test. MasterKey present: {}",
+                    ledgerId, entryId, masterKey != null);
+                logger.warn("[DEBUG] WriteEntryProcessorV3: Digest verification FAILED for ledgerId={}, entryId={}", ledgerId, entryId);
+                addResponse.setStatus(StatusCode.ECHECKSUM); // or a custom checksum error code
+                return addResponse.build();
+            }
+        }
+    
+
         try {
             if (RequestUtils.hasFlag(addRequest, AddRequest.Flag.RECOVERY_ADD)) {
                 requestProcessor.getBookie().recoveryAddEntry(entryToAdd, wcb,
